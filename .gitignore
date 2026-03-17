@@ -1,0 +1,2 @@
+# Keep Streamlit secrets out of version control.
+.streamlit/secrets.toml
