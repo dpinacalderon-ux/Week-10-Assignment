@@ -1,91 +1,46 @@
-"""Basic Streamlit To-Do app setup with safe todos.json and HF API wiring."""
+"""Part A: Core Chat Application setup with Hugging Face API test call."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional, Tuple
 
 import requests
 import streamlit as st
 
-
-TODOS_FILE = Path("todos.json")
 HF_CHAT_ENDPOINT = "https://router.huggingface.co/v1/chat/completions"
 HF_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
-
-
-def load_todos() -> List[Dict[str, Any]]:
-    """Load todos from file safely."""
-    if not TODOS_FILE.exists():
-        return []
-
-    try:
-        raw_content = TODOS_FILE.read_text(encoding="utf-8").strip()
-        if not raw_content:
-            return []
-        data = json.loads(raw_content)
-    except json.JSONDecodeError:
-        st.warning(
-            "todos.json is not valid JSON. "
-            "Using an empty list until this file is fixed."
-        )
-        return []
-    except OSError as err:
-        st.error(f"Could not read todos.json: {err}")
-        return []
-
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and isinstance(data.get("todos"), list):
-        return data["todos"]
-
-    st.warning("todos.json has an unexpected format. Using an empty list.")
-    return []
-
-
-def save_todos(todos: List[Dict[str, Any]]) -> None:
-    """Save todos to file safely."""
-    try:
-        TODOS_FILE.write_text(
-            json.dumps({"todos": todos}, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError as err:
-        st.error(f"Could not write todos.json: {err}")
+TEST_PROMPT = "Hello!"
 
 
 def get_hf_token() -> Optional[str]:
-    """Read Hugging Face token from Streamlit secrets."""
+    """Read HF token from Streamlit secrets safely."""
     try:
         hf_token = st.secrets["HF_TOKEN"]
     except Exception:
         st.error(
-            "Missing HF token. Please add `HF_TOKEN` in `.streamlit/secrets.toml` "
-            "under your project root."
+            "Missing Hugging Face token. Add `.streamlit/secrets.toml` with `HF_TOKEN = \"your_token_here\"`."
         )
         return None
 
     if not isinstance(hf_token, str) or not hf_token.strip():
         st.error(
-            "`HF_TOKEN` is empty. Update `.streamlit/secrets.toml` to include "
-            "a valid token before using AI features."
+            "HF token is empty. Add a valid token in `.streamlit/secrets.toml` under `HF_TOKEN`."
         )
         return None
 
     return hf_token.strip()
 
 
-def ask_model(hf_token: str, prompt: str) -> Optional[str]:
-    """Send a prompt to Hugging Face chat completions endpoint."""
+def ask_test_message(hf_token: str) -> Tuple[Optional[str], Optional[str]]:
+    """Send hardcoded test message and return (response_text, error_message)."""
+    payload = {
+        "model": HF_MODEL,
+        "messages": [{"role": "user", "content": TEST_PROMPT}],
+        "max_tokens": 512,
+    }
     headers = {
         "Authorization": f"Bearer {hf_token}",
         "Content-Type": "application/json",
-    }
-    payload = {
-        "model": HF_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 512,
     }
 
     try:
@@ -95,59 +50,54 @@ def ask_model(hf_token: str, prompt: str) -> Optional[str]:
             json=payload,
             timeout=20,
         )
-        response.raise_for_status()
     except requests.RequestException as err:
-        st.error(f"Could not connect to Hugging Face API: {err}")
-        return None
+        return None, f"Network error while calling the API: {err}"
+
+    if response.status_code == 401:
+        return None, "Invalid or missing Hugging Face token. Please check `HF_TOKEN`."
+    if response.status_code == 429:
+        return None, "Rate limit reached. Try again in a little while."
+    if response.status_code >= 400:
+        return None, f"API request failed with status {response.status_code}: {response.text}"
 
     try:
-        response_json = response.json()
-        choices = response_json.get("choices", [])
-        if not choices:
-            return None
-        return choices[0]["message"]["content"]
-    except (ValueError, KeyError, TypeError) as err:
-        st.error(f"Unexpected response format from API: {err}")
-        return None
+        result = response.json()
+    except ValueError:
+        return None, "Invalid JSON response from API."
+
+    choices = result.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None, "API response did not include any choices."
+
+    message = choices[0].get("message", {})
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None, "API response was missing message content."
+
+    return content.strip(), None
 
 
 def main() -> None:
-    """Render a minimal Streamlit page and test connection to the AI endpoint."""
-    st.set_page_config(page_title="Streamlit To-Do App", page_icon="🗂️")
-    st.title("Streamlit To-Do App")
-
-    st.markdown("### Setup placeholder")
-    st.write("Your app is running. Use this section to add UI components later.")
-
-    todos = load_todos()
-    save_todos(todos)
-
-    with st.container():
-        st.subheader("Saved to-dos")
-        if todos:
-            st.json(todos)
-        else:
-            st.info("No to-dos found yet. Your `todos.json` file is initialized as empty.")
-
-        st.caption(f"Total items: {len(todos)}")
-
-    st.divider()
-    st.subheader("AI Connection Setup")
+    st.set_page_config(page_title="My AI Chat", layout="wide")
+    st.title("My AI Chat")
+    st.markdown("Send a test request to verify API setup.")
 
     hf_token = get_hf_token()
-    prompt = st.text_input("Try a test message", value="Hello!")
-    if st.button("Send test request"):
-        if hf_token is None:
-            st.stop()
+    if hf_token is None:
+        return
 
-        with st.spinner("Calling Hugging Face Inference Router..."):
-            reply = ask_model(hf_token, prompt)
+    # Run once per user session so Streamlit reruns do not repeat the call automatically.
+    if "test_reply" not in st.session_state:
+        reply, error = ask_test_message(hf_token)
+        st.session_state["test_reply"] = reply
+        st.session_state["test_error"] = error
 
-        if reply is None:
-            st.warning("No response text was returned from the model.")
-        else:
-            st.success("Model response:")
-            st.write(reply)
+    if st.session_state.get("test_error"):
+        st.error(st.session_state["test_error"])
+        return
+
+    st.subheader("Model reply")
+    st.write(st.session_state.get("test_reply", "No response returned."))
 
 
 if __name__ == "__main__":
