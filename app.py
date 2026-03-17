@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 from datetime import datetime
+import time
 from typing import Dict, List, Optional, Tuple
 import uuid
 
@@ -135,8 +136,12 @@ def get_hf_token() -> Optional[str]:
     return hf_token.strip()
 
 
-def call_model(messages: List[Message], hf_token: str) -> Tuple[Optional[str], Optional[str]]:
-    """Call Hugging Face with the full conversation history."""
+def call_model(
+    messages: List[Message],
+    hf_token: str,
+    on_chunk: Optional[callable] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Call Hugging Face with streaming and return the full assistant reply."""
     headers = {
         "Authorization": f"Bearer {hf_token}",
         "Content-Type": "application/json",
@@ -144,6 +149,7 @@ def call_model(messages: List[Message], hf_token: str) -> Tuple[Optional[str], O
     payload = {
         "model": HF_MODEL,
         "messages": messages,
+        "stream": True,
         "max_tokens": 512,
     }
 
@@ -152,6 +158,7 @@ def call_model(messages: List[Message], hf_token: str) -> Tuple[Optional[str], O
             HF_CHAT_ENDPOINT,
             headers=headers,
             json=payload,
+            stream=True,
             timeout=20,
         )
     except requests.RequestException as err:
@@ -164,23 +171,49 @@ def call_model(messages: List[Message], hf_token: str) -> Tuple[Optional[str], O
     if response.status_code >= 400:
         return None, f"API error {response.status_code}: {response.text}"
 
+    response_chunks: List[str] = []
     try:
-        body = response.json()
-    except ValueError:
-        return None, "Invalid JSON response from API."
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            if not raw_line.startswith("data: "):
+                continue
 
-    choices = body.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return None, "Model response had no choices."
+            payload_text = raw_line.removeprefix("data: ").strip()
+            if payload_text == "[DONE]":
+                break
 
-    first_choice = choices[0]
-    message = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
-    content = message.get("content") if isinstance(message, dict) else None
+            try:
+                chunk_payload = json.loads(payload_text)
+            except ValueError:
+                continue
 
-    if not isinstance(content, str) or not content.strip():
+            choices = chunk_payload.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+
+            delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+            if not isinstance(delta, dict):
+                continue
+
+            chunk = delta.get("content")
+            if not isinstance(chunk, str):
+                continue
+
+            response_chunks.append(chunk)
+            if on_chunk is not None:
+                on_chunk(chunk)
+
+            # Small delay makes streaming visible even for very fast models.
+            time.sleep(0.03)
+    finally:
+        response.close()
+
+    full_reply = "".join(response_chunks).strip()
+    if not full_reply:
         return None, "Model response content was empty."
 
-    return content.strip(), None
+    return full_reply, None
 
 
 def format_chat_label(chat: ChatState) -> str:
@@ -332,11 +365,21 @@ def main() -> None:
     active_chat["timestamp"] = now_string()
     messages.append({"role": "user", "content": user_message})
 
-    with st.spinner("Thinking..."):
-        assistant_reply, error = call_model(messages, hf_token)
+    with st.chat_message("assistant"):
+        reply_area = st.empty()
+        reply_area.markdown("")
+        assembled_reply = ""
+
+        def on_chunk(chunk: str) -> None:
+            nonlocal assembled_reply
+            assembled_reply += chunk
+            reply_area.markdown(assembled_reply)
+
+        assistant_reply, error = call_model(messages, hf_token, on_chunk=on_chunk)
 
     if error:
         st.error(error)
+        reply_area.empty()
         return
 
     messages.append({"role": "assistant", "content": assistant_reply})
