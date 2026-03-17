@@ -1,7 +1,9 @@
-"""Part C: Chat management with sidebar-based multi-chat support."""
+"""Part D: Chat persistence with sidebar chat management."""
 
 from __future__ import annotations
 
+from pathlib import Path
+import json
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import uuid
@@ -11,9 +13,105 @@ import streamlit as st
 
 HF_CHAT_ENDPOINT = "https://router.huggingface.co/v1/chat/completions"
 HF_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
+CHATS_DIR = Path("chats")
 
 Message = Dict[str, str]
 ChatState = Dict[str, object]
+
+
+def now_string() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def ensure_chats_directory() -> None:
+    try:
+        CHATS_DIR.mkdir(exist_ok=True)
+    except OSError as err:
+        st.error(f"Could not create chats directory: {err}")
+
+
+def build_chat_payload(chat: ChatState) -> str:
+    return json.dumps(
+        {
+            "id": chat["id"],
+            "title": chat["title"],
+            "timestamp": chat["timestamp"],
+            "messages": chat["messages"],
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+def load_chat_file(chat_path: Path) -> Optional[ChatState]:
+    if not chat_path.exists():
+        return None
+    try:
+        raw = chat_path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    chat_id = data.get("id")
+    title = data.get("title")
+    timestamp = data.get("timestamp")
+    messages = data.get("messages")
+
+    if not isinstance(chat_id, str):
+        chat_id = chat_path.stem
+    if not isinstance(title, str):
+        title = "Recovered Chat"
+    if not isinstance(timestamp, str):
+        timestamp = now_string()
+    if not isinstance(messages, list):
+        messages = []
+
+    cleaned_messages: List[Message] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str) or not isinstance(content, str):
+            continue
+        cleaned_messages.append({"role": role, "content": content})
+
+    return {
+        "id": chat_id,
+        "title": title,
+        "timestamp": timestamp,
+        "messages": cleaned_messages,
+    }
+
+
+def load_saved_chats() -> Dict[str, ChatState]:
+    ensure_chats_directory()
+    chats: Dict[str, ChatState] = {}
+
+    for chat_file in CHATS_DIR.glob("*.json"):
+        chat = load_chat_file(chat_file)
+        if chat is None:
+            continue
+        chats[chat["id"]] = chat
+
+    return chats
+
+
+def save_chat(chat: ChatState) -> None:
+    ensure_chats_directory()
+    chat_id = chat.get("id")
+    if not isinstance(chat_id, str):
+        return
+    try:
+        chat_path = CHATS_DIR / f"{chat_id}.json"
+        chat_path.write_text(build_chat_payload(chat), encoding="utf-8")
+    except OSError as err:
+        st.error(f"Could not save chat '{chat_id}': {err}")
 
 
 def get_hf_token() -> Optional[str]:
@@ -92,7 +190,7 @@ def format_chat_label(chat: ChatState) -> str:
 def initialize_chats() -> None:
     """Initialize chat storage in session state."""
     if "chats" not in st.session_state:
-        st.session_state.chats = {}  # type: ignore[attr-defined]
+        st.session_state.chats = load_saved_chats()  # type: ignore[attr-defined]
 
     if "active_chat_id" not in st.session_state:
         st.session_state.active_chat_id = None  # type: ignore[attr-defined]
@@ -103,13 +201,14 @@ def initialize_chats() -> None:
 
 def create_new_chat() -> None:
     chat_id = str(uuid.uuid4())
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    timestamp = now_string()
     st.session_state.chats[chat_id] = {  # type: ignore[attr-defined]
         "id": chat_id,
         "title": "New Chat",
         "timestamp": timestamp,
         "messages": [],
     }
+    save_chat(st.session_state.chats[chat_id])  # type: ignore[attr-defined]
     st.session_state.active_chat_id = chat_id  # type: ignore[attr-defined]
 
 
@@ -131,6 +230,12 @@ def delete_chat(chat_id: str) -> None:
 
     was_active = chat_id == st.session_state.active_chat_id
     del chats[chat_id]
+    chat_file = CHATS_DIR / f"{chat_id}.json"
+    if chat_file.exists():
+        try:
+            chat_file.unlink()
+        except OSError as err:
+            st.error(f"Could not delete chat file '{chat_id}.json': {err}")
 
     if not chats:
         create_new_chat()
@@ -147,6 +252,8 @@ def rename_if_needed(chat: ChatState, user_message: str) -> None:
     if chat["title"] == "New Chat":
         title = user_message.strip()
         chat["title"] = title[:35] + "..." if len(title) > 35 else title
+        chat["timestamp"] = now_string()
+        save_chat(chat)
 
 
 def render_sidebar() -> None:
@@ -222,6 +329,7 @@ def main() -> None:
         return
 
     rename_if_needed(active_chat, user_message)
+    active_chat["timestamp"] = now_string()
     messages.append({"role": "user", "content": user_message})
 
     with st.spinner("Thinking..."):
@@ -232,6 +340,7 @@ def main() -> None:
         return
 
     messages.append({"role": "assistant", "content": assistant_reply})
+    save_chat(active_chat)
     st.rerun()
 
 
